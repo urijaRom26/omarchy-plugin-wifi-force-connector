@@ -83,8 +83,9 @@ Only NetworkManager's own root-owned keyfile under
 `/etc/NetworkManager/system-connections/` holds the result, as it does for any
 WiFi connection.
 
-The plugin never runs anything as root, and needs no `sudo`. It talks to
-NetworkManager over the same session bus the desktop uses.
+The plugin never runs anything as root and never asks for a password or an
+elevated privilege prompt. It talks to NetworkManager over the same session bus
+the desktop uses, exactly like the built-in network panel.
 
 ## The state file, and why it is written this way
 
