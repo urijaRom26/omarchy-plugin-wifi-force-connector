@@ -86,40 +86,79 @@ WiFi connection.
 The plugin never runs anything as root, and needs no `sudo`. It talks to
 NetworkManager over the same session bus the desktop uses.
 
-## The state file, and why it is guarded
+## The state file, and why it is written this way
 
-The plugin remembers the network you picked in a single file:
+The plugin remembers the network you picked in one file:
 
 ```
 $XDG_STATE_HOME/urija.wifi-force-connector/ssid
 ```
 
-That path is predictable, so it is treated as **untrusted**. Before every
-write the plugin verifies, in order:
+That path is predictable, so any process running as you can create it, or
+replace it with a symlink, at any moment. The write is therefore built so that
+**the destination is never opened for writing at all**:
 
-| Check | Meaning | On failure |
-| --- | --- | --- |
-| `test -L` | not a symlink | refuse — never write through a link |
-| `test -e` | does anything exist there? | if absent: create it |
-| `test -f` | is it a plain regular file? | refuse (directory, socket, device…) |
-| `wc -c` | is it empty? | if non-empty: **refuse to overwrite** |
-| `touch` | create if absent | never truncates an existing file |
+1. `statewriter.pl` creates a temp file in the same directory, named with
+   `getpid()` (unpredictable) and mode `0600`, using
+   `O_CREAT | O_EXCL | O_NOFOLLOW` — created fresh, and impossible to be a
+   pre-planted symlink.
+2. The payload is written through that **already-open descriptor**. The temp
+   path is never re-resolved, so nothing can be swapped underneath it.
+3. The file is closed, then `rename(2)` publishes it onto the destination.
 
-The reasoning: **ownership is not consent.** A regular file you own may hold
-unrelated data, and a symlink may point somewhere else entirely. An earlier
-version of this plugin created the file with `install -D /dev/null`, which
-truncates whatever regular file already sits at the path — so simply picking a
-network could destroy an unrelated file. That was reported in
+`rename(2)` is a single atomic syscall on the final name, and it does **not**
+follow a symlink — it replaces the symlink *itself*, leaving the link's target
+untouched. That removes the check-then-write window entirely: there is no
+earlier check whose result could disagree with what is written.
+
+Reading the value is equally deliberate. `FileView` is not used at all — it
+opens paths normally, so a planted symlink would let an attacker choose which
+network name reaches `NetworkManager.connectWithPsk()`. The plugin reads via
+`statewriter.pl --read`, which opens with `O_NOFOLLOW` and requires a plain
+regular file; anything else yields "no saved choice" and the plugin falls back
+to auto-detecting the strongest encrypted network in range.
+
+**Ownership is not consent.** A regular file you own may hold unrelated data,
+so a non-empty pre-existing file is refused rather than replaced — tracked by a
+companion `.owned` marker created with the same `O_EXCL | O_NOFOLLOW`
+discipline. When a write is refused the panel says so (`Not writing state: …`)
+and the plugin keeps working by auto-detecting. Nothing is ever overwritten to
+force it through.
+
+If a write is refused, the connection itself is unaffected: the plugin
+reconnects using the passphrase you typed, and only the *remembered* choice is
+skipped.
+
+### Two earlier bugs, for the record
+
+- **v1.0.0** created the file with `install -D /dev/null`, which truncates
+  whatever regular file already sits at the path.
+- **v1.0.1** replaced that with a chain of `test -L` / `test -e` / `test -f` /
+  `wc -c` guards before the write. That was still wrong: `test -f` *follows*
+  symlinks, and every step re-resolved the pathname, so a symlink planted
+  between the last check and the write turned the write into an
+  arbitrary-file overwrite (TOCTOU).
+
+Both were reported in
 [issue #9145](https://github.com/omacom/omarchy-plugin-marketplace/issues/9145)
-and fixed in 1.0.1.
+and are fixed in 1.1.0.
 
-If the guard refuses a write, the panel says so
-(`Not writing state: …`) and the plugin keeps working — it just falls back to
-auto-detecting the strongest encrypted network in range. Nothing is ever
-overwritten to force it through.
+### Why a Perl helper?
 
-Every step is a fixed argv array. No step passes through a shell, and no step
-interpolates user input into a command string.
+The safe primitive here is `open(2)` with `O_CREAT | O_EXCL | O_NOFOLLOW`
+followed by `rename(2)`. Quickshell's `Process` exposes no descriptor-relative
+API for that, and the shell utilities either follow symlinks (`touch`, `>`,
+`FileView`) or clobber existing data (`mv` without `-T`, `dd` without
+`conv=notrunc`). `perl` is in the base Arch install and is the only thing
+present that can do it in one atomic step per operation.
+
+The payload travels over **stdin**, never argv, and is length-prefixed
+(`<byte-length> <space> <bytes>`) because Quickshell's `Process.write()`
+cannot close stdin — there is no `close()` and no EOF is delivered, so a helper
+that read to EOF would block forever. The prefix is a **byte** count, so
+non-ASCII SSIDs are stored intact.
+
+The passphrase is never passed to this helper, or to any process, at all.
 
 ## Requirements
 

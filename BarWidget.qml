@@ -51,13 +51,41 @@ BarWidget {
   // remembered in the panel's own state file; WIFI_RESCUE_SSID overrides both.
   readonly property string ssidOverride: Quickshell.env("WIFI_RESCUE_SSID") || ""
 
-  readonly property string savedSsid: {
-    if (!configFile.loaded) return ""
-    // FileView exposes contents through the text() METHOD, not a text
-    // property -- `configFile.text` yields the function object itself (it
-    // stringifies to "function text() { [native code] }"). Call it.
-    return String(configFile.text() || "").trim()
+  // The remembered SSID, read by statewriter.pl --read rather than by
+  // FileView. FileView opens the path normally and therefore FOLLOWS a
+  // symlink, so a planted link would feed an attacker-chosen string straight
+  // into NetworkManager.connectWithPsk(). The helper opens with O_NOFOLLOW
+  // and refuses anything that is not a plain regular file, so a symlink at the
+  // path yields "" (auto-detect) instead of a chosen network name.
+  //
+  // This is async, so the value fills in shortly after startup; until then
+  // targetSsid falls back to the strongest encrypted network in range.
+  property string _savedSsid: ""
+
+  function readSavedSsid() {
+    readProc.command = ["/usr/bin/perl", root._pluginDir + "/statewriter.pl", "--read", root._statePath()]
+    readProc.running = true
   }
+
+  function _statePath() {
+    return (Quickshell.env("XDG_STATE_HOME") || (Quickshell.env("HOME") || "") + "/.local/state")
+      + "/urija.wifi-force-connector/ssid"
+  }
+
+  Process {
+    id: readProc
+    command: []
+    running: false
+    stdout: StdioCollector { id: readOut; waitForEnd: true }
+    onExited: function(exitCode) {
+      readProc.running = false
+      // Any failure (missing, symlink, directory, unreadable) means "no saved
+      // choice", which is a safe fallback: auto-detect from the scan.
+      root._savedSsid = exitCode === 0 ? String(readOut.text || "").trim() : ""
+    }
+  }
+
+  readonly property string savedSsid: root._savedSsid
 
   readonly property string targetSsid: root.ssidOverride !== ""
     ? root.ssidOverride
@@ -82,55 +110,56 @@ BarWidget {
     return best
   }
 
+  // Persist the target SSID.
+  //
+  // SECURITY: the destination is a predictable path
+  // ($XDG_STATE_HOME/urija.wifi-force-connector/ssid), so it is treated as
+  // hostile. The write is performed by a single open(2) on a private temp
+  // file followed by an atomic rename(2) onto the destination. Neither step
+  // ever opens the destination for writing, so a symlink planted there --
+  // before, during, or after -- cannot be followed and its target cannot be
+  // modified. See statewriter.pl for the full rationale.
+  //
+  // The payload travels over stdin, never argv: argv is world-readable
+  // through /proc, and the SSID is not a secret, but keeping content out of
+  // argv also keeps it out of any process listing.
   function rememberSsid(ssid) {
     if (ssid === "") return
     root._pendingSsid = ssid
-
-    // FileView.loaded can be stale-true from a previous load even though the
-    // file was since removed, and setText into a missing file silently
-    // no-ops. Verify the destination really is a usable regular file we own
-    // before writing, every time -- the guard chain is cheap and idempotent.
-    root._mkdirRan = false
-    root.ensureConfigFile()
-  }
-
-  // Create the state file WITHOUT clobbering and WITHOUT following symlinks.
-  //
-  // Why not `install -D /dev/null <path>`: it truncates whatever regular file
-  // already sits at that path. The path is predictable
-  // ($XDG_STATE_HOME/urija.wifi-force-connector/ssid), so simply picking a
-  // network would silently destroy an unrelated user file that happened to
-  // occupy it, or follow a planted symlink. `install` is wrong here.
-  //
-  // Safe sequence, each step a fixed argv (never a shell string):
-  //   1. mkdir -p on the DIRECTORY only -- never the file path, which would
-  //      create the file as a directory.
-  //   2. test -L: a symlink at the destination is a hard refusal. This MUST
-  //      come first, because test -O and test -d both FOLLOW symlinks -- a
-  //      link pointing at a file we own would pass an ownership check and we
-  //      would then write through it.
-  //   3. test -d: a directory at the destination is a hard refusal.
-  //   4. test -O: if something is there, it must be a regular file we own.
-  //   5. touch: creates when absent, and NEVER truncates an existing file, so
-  //      a pre-existing regular file of ours keeps its contents.
-  function ensureConfigFile() {
-    if (root._mkdirRan) return
-    root._mkdirRan = true
     root._cfgDir = (Quickshell.env("XDG_STATE_HOME") || (Quickshell.env("HOME") || "") + "/.local/state")
       + "/urija.wifi-force-connector"
     mkdirProc.command = ["mkdir", "-p", root._cfgDir]
     mkdirProc.running = true
   }
 
-  // Step 2 is reached from the mkdir handler; the chain itself starts at
-  // checkSymlink(). Kept as a named entry point for the mkdir callback.
-  function guardAndCreate() {
-    root.checkSymlink()
+  // mkdir finished -> hand the payload to the helper.
+  //
+  // The payload is framed as "<byte-length> <space> <bytes>" because
+  // Quickshell's Process.write() cannot close stdin: there is no close() and
+  // no EOF is delivered, so a helper that read to EOF would block forever
+  // (verified: `tee` never exits under qs). With a length prefix the helper
+  // reads exactly that many bytes and terminates.
+  function stageWrite() {
+    writeProc.stdinEnabled = true
+    writeProc.command = ["/usr/bin/perl", root._pluginDir + "/statewriter.pl", root._cfgDir + "/ssid"]
+    writeProc.running = true
+    Qt.callLater(function() {
+      if (!writeProc.running) return
+      // Byte length, not character length, so UTF-8 SSIDs survive.
+      var n = unescape(encodeURIComponent(root._pendingSsid)).length
+      if (n < 1 || n > 255) {
+        writeProc.running = false
+        root.refuseWrite("network name has an unsupported length")
+        return
+      }
+      writeProc.write(n + " " + root._pendingSsid)
+    })
   }
 
-  function flushPendingSsid() {
-    if (root._pendingSsid === "" || !configFile.loaded) return
-    configFile.setText(root._pendingSsid)
+  function finishWrite() {
+    // The file on disk is already updated; keep the in-memory value in step so
+    // targetSsid does not stay on the previous choice until the next restart.
+    root._savedSsid = root._pendingSsid
     root._pendingSsid = ""
   }
 
@@ -252,39 +281,30 @@ BarWidget {
     onTriggered: root.finishAttempt(false, "Timed out after 20 s")
   }
 
-  // Remembered target SSID. Machine-portable (HOME, never a hardcoded user
-  // path) and holds no secret -- only the network name.
-  //
-  // Build the path by CONCATENATION: `Quickshell.env("XDG_STATE_HOME") ||
-  // <fallback>` short-circuits to the bare state dir and drops the subdir,
-  // which makes FileView try to open a directory. Also note FileView cannot
-  // create missing parent directories, so the dir must already exist.
-  FileView {
-    id: configFile
-    path: (Quickshell.env("XDG_STATE_HOME") || (Quickshell.env("HOME") || "") + "/.local/state")
-      + "/urija.wifi-force-connector/ssid"
-    watchChanges: false
-    printErrors: true
-  }
+  // The remembered SSID is read and written exclusively through
+  // statewriter.pl (see readSavedSsid / rememberSsid). There is deliberately
+  // no FileView here: it opens paths normally and would follow a symlink at
+  // this predictable location, on both read and write.
 
-  // Guard chain. Order matters and is the whole point of this rewrite.
+  // ---- state write --------------------------------------------------------
   //
-  // The destination path is predictable, so it is treated as UNTRUSTED until
-  // this plugin has provably created the file itself. Nothing here decides
-  // "the file is mine to overwrite" from ownership alone -- a regular file
-  // this user happens to own may hold entirely unrelated data, and clobbering
-  // it because we own it is exactly the bug this guards against.
+  // There is deliberately NO check-then-write chain here. An earlier version
+  // ran `test -L`, `test -e`, `test -f`, `wc -c`, `touch` and then
+  // FileView.setText() as a sequence of separate processes. That was wrong
+  // twice over:
   //
-  //   test -L  -> symlink: hard refusal (checked first; test -d and -O both
-  //               follow symlinks, so an ownership check alone would approve
-  //               a link to a file we own and we would write through it).
-  //   test -e  -> nothing there: the normal first run, safe to create.
-  //   test -f  -> exists and is a regular file. Its CONTENT decides: if it is
-  //               non-empty we did not create it, so we refuse rather than
-  //               overwrite whatever the user (or another program) put there.
-  //               An empty regular file can only be one we just touched.
-  //   touch    -> creates when absent and never truncates.
-  //   setText  -> writes only after the file is empty or was already ours.
+  //   * test -f FOLLOWS symlinks, so it approves a symlink whose target is a
+  //     regular file. The guard passed and the write then went through the
+  //     link.
+  //   * every step re-resolved the pathname, so a same-user process could
+  //     swap in a symlink between the last check and the write. The value
+  //     checked was never the value written.
+  //
+  // The write is now a single process -- statewriter.pl -- which creates a
+  // private temp file with O_CREAT|O_EXCL|O_NOFOLLOW, writes the payload
+  // through that already-open descriptor, and publishes it with rename(2).
+  // rename replaces the destination *name* and never follows a symlink there,
+  // so there is no check/write window at all. See statewriter.pl.
   Process {
     id: mkdirProc
     command: []
@@ -292,142 +312,29 @@ BarWidget {
     onExited: function(exitCode) {
       mkdirProc.running = false
       if (exitCode !== 0) {
-        console.warn("WifiForceConnector: could not create state dir (exit " + exitCode + ")")
+        root.refuseWrite("could not create state directory (exit " + exitCode + ")")
         return
       }
-      root.checkSymlink()
+      root.stageWrite()
     }
   }
 
-  // 1. Symlink check. Must be first.
+  // The single write path. Payload goes over stdin, never argv.
   Process {
-    id: linkProc
+    id: writeProc
     command: []
     running: false
+    stdinEnabled: true
+    stderr: StdioCollector { id: writeStderr; waitForEnd: true }
     onExited: function(exitCode) {
-      linkProc.running = false
-      if (exitCode === 0) {
-        root.refuseWrite("state path is a symlink")
-        return
-      }
-      root.checkExists()
-    }
-  }
-
-  // 2. Does anything exist at the path?
-  Process {
-    id: existsProc
-    command: []
-    running: false
-    onExited: function(exitCode) {
-      existsProc.running = false
+      writeProc.running = false
       if (exitCode !== 0) {
-        // Absent: the normal first run. Create it.
-        root.touchStateFile()
+        var why = String(writeStderr.text || "").trim()
+        root.refuseWrite(why !== "" ? why : "state write refused (exit " + exitCode + ")")
         return
       }
-      // Present and not a symlink: must be a regular file...
-      root.checkIsRegular()
+      root.finishWrite()
     }
-  }
-
-  // 3. A directory (or anything that is not a plain file) is a refusal.
-  Process {
-    id: isDirProc
-    command: []
-    running: false
-    onExited: function(exitCode) {
-      isDirProc.running = false
-      if (exitCode !== 0) {
-        root.refuseWrite("state path is not a regular file")
-        return
-      }
-      // A regular file exists. If it has content, it is not ours to replace.
-      root.checkIsEmpty()
-    }
-  }
-
-  // 4. Non-empty pre-existing file -> refuse. This is the case that would
-  // otherwise destroy an unrelated file the user already had at this path.
-  Process {
-    id: emptyProc
-    command: []
-    running: false
-    stdout: StdioCollector { id: sizeStdout; waitForEnd: true }
-    onExited: function(exitCode) {
-      emptyProc.running = false
-      // `wc -c <file>` prints "BYTES /path/to/file", so take the FIRST field.
-      // Comparing the whole output to "0" never matches and would refuse
-      // every write, including the legitimate first-run create.
-      var out = String(sizeStdout.text || "").trim().split(/\s+/)[0]
-      if (out !== "0") {
-        root.refuseWrite("state file already contains data; not overwriting")
-        return
-      }
-      // Empty (or a file we previously wrote and cleared): safe to write.
-      root.writeState()
-    }
-  }
-
-  // Final create. `touch` (no -c/-a) creates the file when missing and never
-  // empties an existing one. Fixed argv, no shell.
-  Process {
-    id: touchProc
-    command: []
-    running: false
-    onExited: function(exitCode) {
-      touchProc.running = false
-      if (exitCode !== 0) {
-        root.refuseWrite("could not create state file (exit " + exitCode + ")")
-        return
-      }
-      // The file now exists, so FileView can materialise. Reload brings it up
-      // loaded; onLoaded then flushes the queued SSID.
-      Qt.callLater(function() { configFile.reload() })
-    }
-  }
-
-  function checkSymlink() {
-    linkProc.command = ["/usr/bin/test", "-L", root._cfgDir + "/ssid"]
-    linkProc.running = true
-  }
-
-  function checkExists() {
-    existsProc.command = ["/usr/bin/test", "-e", root._cfgDir + "/ssid"]
-    existsProc.running = true
-  }
-
-  function checkIsRegular() {
-    // -f is false for directories AND for symlinks-to-anything, so this also
-    // double-guards the symlink case even if -L were somehow bypassed.
-    isDirProc.command = ["/usr/bin/test", "-f", root._cfgDir + "/ssid"]
-    isDirProc.running = true
-  }
-
-  function checkIsEmpty() {
-    // wc -c counts bytes; only a zero-byte file is treated as ours-to-fill.
-    emptyProc.command = ["wc", "-c", root._cfgDir + "/ssid"]
-    emptyProc.running = true
-  }
-
-  function touchStateFile() {
-    touchProc.command = ["touch", root._cfgDir + "/ssid"]
-    touchProc.running = true
-  }
-
-  // Write the queued SSID. Only reached once the guard chain has proven the
-  // destination is absent or an empty regular file, so this cannot destroy
-  // pre-existing content.
-  function writeState() {
-    if (root._pendingSsid === "") return
-    Qt.callLater(function() {
-      if (!configFile.loaded) {
-        configFile.reload()
-        return
-      }
-      configFile.setText(root._pendingSsid)
-      root._pendingSsid = ""
-    })
   }
 
   // Refuse to write and surface it. Never falls back to a destructive write.
@@ -438,15 +345,31 @@ BarWidget {
     console.warn("WifiForceConnector: " + root.resultMessage)
   }
 
-  property bool _mkdirRan: false
   property string _cfgDir: ""
   property string _pendingSsid: ""
 
-  // Flush once the FileView reports itself loaded (first run: the file does
-  // not exist yet, so loaded only fires after mkdir + reload).
-  Connections {
-    target: configFile
-    function onLoaded() { root.flushPendingSsid() }
+  // Absolute path to this plugin's own directory, so the helper script is
+  // found no matter where `omarchy plugin add` installed it.
+  //
+  // Qt.resolvedUrl() returns a *URL* ("file:///home/..."), which is not a
+  // usable argv value -- perl looks for a literal path named
+  // "file:///home/..." and fails. Strip the scheme, then percent-decode
+  // (a plugin id or install path may contain spaces or other escapes).
+  readonly property string _pluginDir: {
+    var u = String(Qt.resolvedUrl("."))
+    u = u.replace(/^file:\/\/\//, "/")
+    return decodeURIComponent(u).replace(/\/$/, "")
+  }
+
+  // Load the remembered SSID once the shell has finished starting. Until this
+  // resolves, targetSsid falls back to auto-detection, which is a safe
+  // default: it never connects to a name an attacker chose.
+  Timer {
+    id: startupRead
+    interval: 400
+    running: true
+    repeat: false
+    onTriggered: root.readSavedSsid()
   }
 
   // Success is observed from the model, not from a return value.
