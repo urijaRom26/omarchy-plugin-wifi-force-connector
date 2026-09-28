@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "id": "urija.wifi-force-connector",
+  "name": "WiFi Force Connector",
+  "version": "1.0.0",
+  "author": "Urija Rom",
+  "license": "MIT",
+  "description": "One-click WiFi recovery: a bar button opens a panel with a big CONNECT button that recreates your NetworkManager profile with a freshly typed passphrase. Fixes stale saved-password profiles that leave the machine stuck asking for secrets it can never get.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "WiFi Force Connector",
+    "description": "Big CONNECT button that re-creates the WiFi profile with a fresh passphrase",
+    "category": "System",
+    "aliases": [
+      "wifi",
+      "wifi-reconnect",
+      "wifi-rescue",
+      "network-rescue",
+      "connect-wifi"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
