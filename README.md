@@ -86,6 +86,41 @@ WiFi connection.
 The plugin never runs anything as root, and needs no `sudo`. It talks to
 NetworkManager over the same session bus the desktop uses.
 
+## The state file, and why it is guarded
+
+The plugin remembers the network you picked in a single file:
+
+```
+$XDG_STATE_HOME/urija.wifi-force-connector/ssid
+```
+
+That path is predictable, so it is treated as **untrusted**. Before every
+write the plugin verifies, in order:
+
+| Check | Meaning | On failure |
+| --- | --- | --- |
+| `test -L` | not a symlink | refuse — never write through a link |
+| `test -e` | does anything exist there? | if absent: create it |
+| `test -f` | is it a plain regular file? | refuse (directory, socket, device…) |
+| `wc -c` | is it empty? | if non-empty: **refuse to overwrite** |
+| `touch` | create if absent | never truncates an existing file |
+
+The reasoning: **ownership is not consent.** A regular file you own may hold
+unrelated data, and a symlink may point somewhere else entirely. An earlier
+version of this plugin created the file with `install -D /dev/null`, which
+truncates whatever regular file already sits at the path — so simply picking a
+network could destroy an unrelated file. That was reported in
+[issue #9145](https://github.com/omacom/omarchy-plugin-marketplace/issues/9145)
+and fixed in 1.0.1.
+
+If the guard refuses a write, the panel says so
+(`Not writing state: …`) and the plugin keeps working — it just falls back to
+auto-detecting the strongest encrypted network in range. Nothing is ever
+overwritten to force it through.
+
+Every step is a fixed argv array. No step passes through a shell, and no step
+interpolates user input into a command string.
+
 ## Requirements
 
 - NetworkManager (checked at runtime; the panel reports `no NetworkManager`

@@ -85,28 +85,47 @@ BarWidget {
   function rememberSsid(ssid) {
     if (ssid === "") return
     root._pendingSsid = ssid
-    if (configFile.loaded) {
-      configFile.setText(ssid)
-      root._pendingSsid = ""
-      return
-    }
-    // File doesn't exist yet, so FileView has nothing loaded to write into.
-    // Create the file, then flush the pending value once the view is live.
+
+    // FileView.loaded can be stale-true from a previous load even though the
+    // file was since removed, and setText into a missing file silently
+    // no-ops. Verify the destination really is a usable regular file we own
+    // before writing, every time -- the guard chain is cheap and idempotent.
+    root._mkdirRan = false
     root.ensureConfigFile()
   }
 
-  // FileView cannot create missing parent directories, and `loaded` stays
-  // FALSE for a file that does not exist -- so gating the first write on
-  // `loaded` deadlocks it. `install -D /dev/null <path>` creates every
-  // leading dir AND an empty regular file in ONE fixed argv (no shell string,
-  // no per-request createObject). `mkdir -p <path>` is the trap: it happily
-  // creates the FILE ITSELF as a directory, and setText then fails to save
-  // while still reading back correct in memory.
+  // Create the state file WITHOUT clobbering and WITHOUT following symlinks.
+  //
+  // Why not `install -D /dev/null <path>`: it truncates whatever regular file
+  // already sits at that path. The path is predictable
+  // ($XDG_STATE_HOME/urija.wifi-force-connector/ssid), so simply picking a
+  // network would silently destroy an unrelated user file that happened to
+  // occupy it, or follow a planted symlink. `install` is wrong here.
+  //
+  // Safe sequence, each step a fixed argv (never a shell string):
+  //   1. mkdir -p on the DIRECTORY only -- never the file path, which would
+  //      create the file as a directory.
+  //   2. test -L: a symlink at the destination is a hard refusal. This MUST
+  //      come first, because test -O and test -d both FOLLOW symlinks -- a
+  //      link pointing at a file we own would pass an ownership check and we
+  //      would then write through it.
+  //   3. test -d: a directory at the destination is a hard refusal.
+  //   4. test -O: if something is there, it must be a regular file we own.
+  //   5. touch: creates when absent, and NEVER truncates an existing file, so
+  //      a pre-existing regular file of ours keeps its contents.
   function ensureConfigFile() {
+    if (root._mkdirRan) return
     root._mkdirRan = true
-    var base = Quickshell.env("XDG_STATE_HOME") || (Quickshell.env("HOME") || "") + "/.local/state"
-    mkdirProc.command = ["install", "-D", "/dev/null", base + "/urija.wifi-force-connector/ssid"]
+    root._cfgDir = (Quickshell.env("XDG_STATE_HOME") || (Quickshell.env("HOME") || "") + "/.local/state")
+      + "/urija.wifi-force-connector"
+    mkdirProc.command = ["mkdir", "-p", root._cfgDir]
     mkdirProc.running = true
+  }
+
+  // Step 2 is reached from the mkdir handler; the chain itself starts at
+  // checkSymlink(). Kept as a named entry point for the mkdir callback.
+  function guardAndCreate() {
+    root.checkSymlink()
   }
 
   function flushPendingSsid() {
@@ -248,8 +267,24 @@ BarWidget {
     printErrors: true
   }
 
-  // One reusable Process (never per-request createObject -- Quickshell can
-  // wedge a component-created Process before it ever spawns).
+  // Guard chain. Order matters and is the whole point of this rewrite.
+  //
+  // The destination path is predictable, so it is treated as UNTRUSTED until
+  // this plugin has provably created the file itself. Nothing here decides
+  // "the file is mine to overwrite" from ownership alone -- a regular file
+  // this user happens to own may hold entirely unrelated data, and clobbering
+  // it because we own it is exactly the bug this guards against.
+  //
+  //   test -L  -> symlink: hard refusal (checked first; test -d and -O both
+  //               follow symlinks, so an ownership check alone would approve
+  //               a link to a file we own and we would write through it).
+  //   test -e  -> nothing there: the normal first run, safe to create.
+  //   test -f  -> exists and is a regular file. Its CONTENT decides: if it is
+  //               non-empty we did not create it, so we refuse rather than
+  //               overwrite whatever the user (or another program) put there.
+  //               An empty regular file can only be one we just touched.
+  //   touch    -> creates when absent and never truncates.
+  //   setText  -> writes only after the file is empty or was already ours.
   Process {
     id: mkdirProc
     command: []
@@ -257,16 +292,154 @@ BarWidget {
     onExited: function(exitCode) {
       mkdirProc.running = false
       if (exitCode !== 0) {
-        console.warn("WifiForceConnector: could not create state file (exit " + exitCode + ")")
+        console.warn("WifiForceConnector: could not create state dir (exit " + exitCode + ")")
         return
       }
-      // The file exists now, so the FileView can materialise. Reload brings
-      // it up loaded; onLoaded then flushes the queued SSID.
+      root.checkSymlink()
+    }
+  }
+
+  // 1. Symlink check. Must be first.
+  Process {
+    id: linkProc
+    command: []
+    running: false
+    onExited: function(exitCode) {
+      linkProc.running = false
+      if (exitCode === 0) {
+        root.refuseWrite("state path is a symlink")
+        return
+      }
+      root.checkExists()
+    }
+  }
+
+  // 2. Does anything exist at the path?
+  Process {
+    id: existsProc
+    command: []
+    running: false
+    onExited: function(exitCode) {
+      existsProc.running = false
+      if (exitCode !== 0) {
+        // Absent: the normal first run. Create it.
+        root.touchStateFile()
+        return
+      }
+      // Present and not a symlink: must be a regular file...
+      root.checkIsRegular()
+    }
+  }
+
+  // 3. A directory (or anything that is not a plain file) is a refusal.
+  Process {
+    id: isDirProc
+    command: []
+    running: false
+    onExited: function(exitCode) {
+      isDirProc.running = false
+      if (exitCode !== 0) {
+        root.refuseWrite("state path is not a regular file")
+        return
+      }
+      // A regular file exists. If it has content, it is not ours to replace.
+      root.checkIsEmpty()
+    }
+  }
+
+  // 4. Non-empty pre-existing file -> refuse. This is the case that would
+  // otherwise destroy an unrelated file the user already had at this path.
+  Process {
+    id: emptyProc
+    command: []
+    running: false
+    stdout: StdioCollector { id: sizeStdout; waitForEnd: true }
+    onExited: function(exitCode) {
+      emptyProc.running = false
+      // `wc -c <file>` prints "BYTES /path/to/file", so take the FIRST field.
+      // Comparing the whole output to "0" never matches and would refuse
+      // every write, including the legitimate first-run create.
+      var out = String(sizeStdout.text || "").trim().split(/\s+/)[0]
+      if (out !== "0") {
+        root.refuseWrite("state file already contains data; not overwriting")
+        return
+      }
+      // Empty (or a file we previously wrote and cleared): safe to write.
+      root.writeState()
+    }
+  }
+
+  // Final create. `touch` (no -c/-a) creates the file when missing and never
+  // empties an existing one. Fixed argv, no shell.
+  Process {
+    id: touchProc
+    command: []
+    running: false
+    onExited: function(exitCode) {
+      touchProc.running = false
+      if (exitCode !== 0) {
+        root.refuseWrite("could not create state file (exit " + exitCode + ")")
+        return
+      }
+      // The file now exists, so FileView can materialise. Reload brings it up
+      // loaded; onLoaded then flushes the queued SSID.
       Qt.callLater(function() { configFile.reload() })
     }
   }
 
+  function checkSymlink() {
+    linkProc.command = ["/usr/bin/test", "-L", root._cfgDir + "/ssid"]
+    linkProc.running = true
+  }
+
+  function checkExists() {
+    existsProc.command = ["/usr/bin/test", "-e", root._cfgDir + "/ssid"]
+    existsProc.running = true
+  }
+
+  function checkIsRegular() {
+    // -f is false for directories AND for symlinks-to-anything, so this also
+    // double-guards the symlink case even if -L were somehow bypassed.
+    isDirProc.command = ["/usr/bin/test", "-f", root._cfgDir + "/ssid"]
+    isDirProc.running = true
+  }
+
+  function checkIsEmpty() {
+    // wc -c counts bytes; only a zero-byte file is treated as ours-to-fill.
+    emptyProc.command = ["wc", "-c", root._cfgDir + "/ssid"]
+    emptyProc.running = true
+  }
+
+  function touchStateFile() {
+    touchProc.command = ["touch", root._cfgDir + "/ssid"]
+    touchProc.running = true
+  }
+
+  // Write the queued SSID. Only reached once the guard chain has proven the
+  // destination is absent or an empty regular file, so this cannot destroy
+  // pre-existing content.
+  function writeState() {
+    if (root._pendingSsid === "") return
+    Qt.callLater(function() {
+      if (!configFile.loaded) {
+        configFile.reload()
+        return
+      }
+      configFile.setText(root._pendingSsid)
+      root._pendingSsid = ""
+    })
+  }
+
+  // Refuse to write and surface it. Never falls back to a destructive write.
+  function refuseWrite(reason) {
+    root._pendingSsid = ""
+    root.resultIsError = true
+    root.resultMessage = "Not writing state: " + reason
+    console.warn("WifiForceConnector: " + root.resultMessage)
+  }
+
   property bool _mkdirRan: false
+  property string _cfgDir: ""
   property string _pendingSsid: ""
 
   // Flush once the FileView reports itself loaded (first run: the file does
